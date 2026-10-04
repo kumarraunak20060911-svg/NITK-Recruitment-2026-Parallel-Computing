@@ -1,159 +1,170 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <stdbool.h>
-#include <string.h>
 #include <time.h>
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES3/gl31.h>
 
-#define M 10
+static const char *CS_SRC =
+    "#version 310 es\n"
+    "layout(local_size_x = 16, local_size_y = 16) in;\n"
+    "layout(std430, binding = 0) readonly buffer I { uint g_in[]; };\n"
+    "layout(std430, binding = 1) writeonly buffer O { uint g_out[]; };\n"
+    "uniform int u_m;\n"
+    "uniform float u_s;\n"
+    "\n"
+    "float rnd(vec2 p) {\n"
+    "    return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
+    "    if (p.x >= u_m || p.y >= u_m) return;\n"
+    "    int idx = p.y * u_m + p.x;\n"
+    "    uint st = g_in[idx];\n"
+    "    uint nxt = st;\n"
+    "\n"
+    "    if (st == 1u) {\n"
+    "        nxt = 2u;\n"
+    "    } else if (st == 0u) {\n"
+    "        bool f = false;\n"
+    "        for (int dy = -1; dy <= 1 && !f; ++dy) {\n"
+    "            for (int dx = -1; dx <= 1 && !f; ++dx) {\n"
+    "                if (dx == 0 && dy == 0) continue;\n"
+    "                int nx = p.x + dx, ny = p.y + dy;\n"
+    "                if (nx >= 0 && nx < u_m && ny >= 0 && ny < u_m) {\n"
+    "                    if (g_in[ny * u_m + nx] == 1u) f = true;\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "        if (f && rnd(vec2(p) + vec2(u_s, u_s * 1.618)) < 0.15) nxt = 1u;\n"
+    "    }\n"
+    "    g_out[idx] = nxt;\n"
+    "}\n";
 
-const char *shader_code =
-"#version 310 es\n"
-"layout(local_size_x = 16, local_size_y = 16) in;\n"
-"layout(std430, binding = 0) readonly buffer InBuf { int in_grid[]; };\n"
-"layout(std430, binding = 1) writeonly buffer OutBuf { int out_grid[]; };\n"
-"uniform int u_size;\n"
-"uniform float u_seed;\n"
-"\n"
-"float rand(vec2 co) {\n"
-"    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);\n"
-"}\n"
-"\n"
-"void main() {\n"
-"    int x = int(gl_GlobalInvocationID.x);\n"
-"    int y = int(gl_GlobalInvocationID.y);\n"
-"    if (x >= u_size || y >= u_size) return;\n"
-"    int idx = y * u_size + x;\n"
-"    int current = in_grid[idx];\n"
-"    int next = current;\n"
-"\n"
-"    if (current == 1) {\n"
-"        next = 2;\n"
-"    } else if (current == 0) {\n"
-"        bool near_fire = false;\n"
-"        for (int dy = -1; dy <= 1; dy++) {\n"
-"            for (int dx = -1; dx <= 1; dx++) {\n"
-"                if (dx == 0 && dy == 0) continue;\n"
-"                int nx = x + dx, ny = y + dy;\n"
-"                if (nx >= 0 && nx < u_size && ny >= 0 && ny < u_size) {\n"
-"                    if (in_grid[ny * u_size + nx] == 1) { near_fire = true; break; }\n"
-"                }\n"
-"            }\n"
-"            if (near_fire) break;\n"
-"        }\n"
-"        if (near_fire && rand(vec2(float(idx), u_seed)) < 0.15) {\n"
-"            next = 1;\n"
-"        }\n"
-"    }\n"
-"    out_grid[idx] = next;\n"
-"}\n";
-
-void print_grid(int *grid, int epoch) {
-    printf("Epoch %d:\n", epoch);
-    for (int y = 0; y < M; y++) {
-        for (int x = 0; x < M; x++) {
-            int val = grid[y * M + x];
-            if (val == 0) printf("H ");
-            else if (val == 1) printf("B ");
-            else printf("N ");
+static void dump_grid(const uint32_t *g, int m, int ep) {
+    printf("Epoch %d:\n", ep);
+    for (int r = 0; r < m; ++r) {
+        for (int c = 0; c < m; ++c) {
+            uint32_t v = g[r * m + c];
+            putchar(v == 0 ? 'H' : (v == 1 ? 'B' : '.'));
+            putchar(' ');
         }
-        printf("\n");
+        putchar('\n');
     }
-    printf("\n");
+    putchar('\n');
 }
 
-int main() {
-    srand((unsigned int)time(NULL));
+static GLuint make_shader(const char *src) {
+    GLuint s = glCreateShader(GL_COMPUTE_SHADER);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(s, sizeof(log), NULL, log);
+        fprintf(stderr, "Shader compile failed:\n%s\n", log);
+        exit(1);
+    }
+    return s;
+}
 
-    EGLDisplay display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    eglInitialize(display, NULL, NULL);
+static void sim_grid(EGLDisplay dpy, EGLContext ctx, int m) {
+    size_t sz = (size_t)m * m * sizeof(uint32_t);
+    uint32_t *buf = (uint32_t *)malloc(sz);
+    for (int i = 0; i < m * m; ++i) buf[i] = 0;
+    
+    buf[(m / 2) * m + (m / 2)] = 1;
 
-    EGLConfig config;
-    EGLint num_config;
-    EGLint attribs[] = {
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
-        EGL_NONE
-    };
-    eglChooseConfig(display, attribs, &config, 1, &num_config);
+    GLuint b[2];
+    glGenBuffers(2, b);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, b[0]);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sz, buf, GL_DYNAMIC_COPY);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, b[1]);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, sz, buf, GL_DYNAMIC_COPY);
 
-    EGLint ctx_attribs[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-    EGLContext context = eglCreateContext(display, config, EGL_NO_CONTEXT, ctx_attribs);
+    GLuint cs = make_shader(CS_SRC);
+    GLuint pg = glCreateProgram();
+    glAttachShader(pg, cs);
+    glLinkProgram(pg);
 
-    EGLint pbuf_attribs[] = { EGL_WIDTH, 16, EGL_HEIGHT, 16, EGL_NONE };
-    EGLSurface surface = eglCreatePbufferSurface(display, config, pbuf_attribs);
-    eglMakeCurrent(display, surface, surface, context);
+    GLint u_m_loc = glGetUniformLocation(pg, "u_m");
+    GLint u_s_loc = glGetUniformLocation(pg, "u_s");
 
-    GLuint shader = glCreateShader(GL_COMPUTE_SHADER);
-    glShaderSource(shader, 1, &shader_code, NULL);
-    glCompileShader(shader);
+    glUseProgram(pg);
+    glUniform1i(u_m_loc, m);
 
-    GLuint program = glCreateProgram();
-    glAttachShader(program, shader);
-    glLinkProgram(program);
-    glUseProgram(program);
+    int pp = 0, ep = 0;
+    bool active = true;
 
-    int total = M * M;
-    int *grid = (int*)calloc(total, sizeof(int));
-    grid[(M / 2) * M + (M / 2)] = 1;
+    if (m <= 20) dump_grid(buf, m, ep);
 
-    GLuint ssbo[2];
-    glGenBuffers(2, ssbo);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[0]);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, total * sizeof(int), grid, GL_DYNAMIC_COPY);
+    while (active) {
+        ep++;
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, b[pp]);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, b[1 - pp]);
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[1]);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, total * sizeof(int), NULL, GL_DYNAMIC_COPY);
+        glUniform1f(u_s_loc, (float)rand() / (float)RAND_MAX + (float)ep);
 
-    GLint u_size = glGetUniformLocation(program, "u_size");
-    GLint u_seed = glGetUniformLocation(program, "u_seed");
-    glUniform1i(u_size, M);
-
-    int epoch = 0;
-    int in_buf = 0, out_buf = 1;
-
-    if (M <= 20) print_grid(grid, epoch);
-
-    while (1) {
-        int burning_count = 0;
-        for (int i = 0; i < total; i++) {
-            if (grid[i] == 1) burning_count++;
-        }
-        if (burning_count == 0) break;
-
-        epoch++;
-        glUniform1f(u_seed, (float)rand() / RAND_MAX);
-
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo[in_buf]);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo[out_buf]);
-
-        GLuint groups = (M + 15) / 16;
-        glDispatchCompute(groups, groups, 1);
+        glDispatchCompute((m + 15) / 16, (m + 15) / 16, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[out_buf]);
-        void *ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, total * sizeof(int), GL_MAP_READ_BIT);
-        if (ptr) {
-            memcpy(grid, ptr, total * sizeof(int));
-            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, b[1 - pp]);
+        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sz, buf);
+
+        active = false;
+        for (int i = 0; i < m * m; ++i) {
+            if (buf[i] == 1) { active = true; break; }
         }
 
-        if (M <= 20) print_grid(grid, epoch);
-
-        int temp = in_buf;
-        in_buf = out_buf;
-        out_buf = temp;
+        if (m <= 20) dump_grid(buf, m, ep);
+        pp = 1 - pp;
     }
 
-    printf("Fire extinguished in %d epochs for M = %d.\n", epoch, M);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
 
-    free(grid);
-    glDeleteBuffers(2, ssbo);
-    glDeleteProgram(program);
-    eglDestroyContext(display, context);
-    eglTerminate(display);
+    printf("[M=%d] Extinguished in %d epochs | GPU Compute Time: %.4f s\n", m, ep, dt);
 
+    glDeleteBuffers(2, b);
+    glDeleteProgram(pg);
+    glDeleteShader(cs);
+    free(buf);
+}
+
+int main(void) {
+    srand((unsigned int)time(NULL));
+
+    EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (dpy == EGL_NO_DISPLAY) return 1;
+
+    EGLint maj, min;
+    if (!eglInitialize(dpy, &maj, &min)) return 1;
+
+    EGLint cfg_attr[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR, EGL_NONE };
+    EGLConfig cfg;
+    EGLint n_cfg;
+    eglChooseConfig(dpy, cfg_attr, &cfg, 1, &n_cfg);
+
+    EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
+    EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attr);
+    if (ctx == EGL_NO_CONTEXT) return 1;
+
+    if (!eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) return 1;
+
+    int test_m[] = {16, 64, 256, 512};
+    for (size_t i = 0; i < sizeof(test_m) / sizeof(test_m[0]); ++i) {
+        sim_grid(dpy, ctx, test_m[i]);
+    }
+
+    eglDestroyContext(dpy, ctx);
+    eglTerminate(dpy);
     return 0;
 }
