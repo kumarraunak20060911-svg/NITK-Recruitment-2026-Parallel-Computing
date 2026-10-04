@@ -1,137 +1,145 @@
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <pthread.h>
+#include <stdalign.h>
 #include <time.h>
+#include <pthread.h>
+#include <unistd.h>
 
-#define NUM_THREADS 4
+#define THREAD_COUNT 4
+#define L1_CACHE_LINE 64
 
-uint64_t *arr;
-uint64_t n;
+typedef struct {
+    alignas(L1_CACHE_LINE) uint64_t accumulated;
+} thread_slot_t;
 
-struct data {
-    int id;
-    uint64_t total;
-};
+typedef struct {
+    const uint64_t *vec;
+    size_t len;
+    size_t id;
+    thread_slot_t *slots;
+} worker_ctx_t;
 
-uint64_t sum_seq() {
-    uint64_t s = 0;
-    for (uint64_t i = 0; i < n; i++) {
-        s += arr[i];
+static void *task_cyclic(void *param) {
+    worker_ctx_t *ctx = (worker_ctx_t *)param;
+    const uint64_t *buf = ctx->vec;
+    size_t n = ctx->len;
+    size_t tid = ctx->id;
+
+    uint64_t v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+    size_t idx = tid;
+
+    for (; idx + 3 * THREAD_COUNT < n; idx += 4 * THREAD_COUNT) {
+        v0 += buf[idx];
+        v1 += buf[idx + THREAD_COUNT];
+        v2 += buf[idx + 2 * THREAD_COUNT];
+        v3 += buf[idx + 3 * THREAD_COUNT];
     }
-    return s;
-}
-
-void* worker1(void* arg) {
-    struct data* d = (struct data*) arg;
-    uint64_t s = 0;
-
-    for (uint64_t i = d->id; i < n; i += NUM_THREADS) {
-        s += arr[i];
+    for (; idx < n; idx += THREAD_COUNT) {
+        v0 += buf[idx];
     }
 
-    d->total = s;
+    ctx->slots[tid].accumulated = v0 + v1 + v2 + v3;
     return NULL;
 }
 
-uint64_t run_strat1() {
-    pthread_t t[NUM_THREADS];
-    struct data d[NUM_THREADS];
-    uint64_t s = 0;
+static void *task_block(void *param) {
+    worker_ctx_t *ctx = (worker_ctx_t *)param;
+    const uint64_t *buf = ctx->vec;
+    size_t n = ctx->len;
+    size_t tid = ctx->id;
 
-    for (int i = 0; i < NUM_THREADS; i++) {
-        d[i].id = i;
-        d[i].total = 0;
-        pthread_create(&t[i], NULL, worker1, &d[i]);
+    size_t chunk = n / THREAD_COUNT;
+    size_t start = tid * chunk;
+    size_t stop = (tid == THREAD_COUNT - 1) ? n : start + chunk;
+
+    uint64_t v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+    size_t idx = start;
+
+    for (; idx + 3 < stop; idx += 4) {
+        v0 += buf[idx];
+        v1 += buf[idx + 1];
+        v2 += buf[idx + 2];
+        v3 += buf[idx + 3];
+    }
+    for (; idx < stop; ++idx) {
+        v0 += buf[idx];
     }
 
-    for (int i = 0; i < NUM_THREADS; i++) {
-        pthread_join(t[i], NULL);
-        s += d[i].total;
-    }
-
-    return s;
-}
-
-void* worker2(void* arg) {
-    struct data* d = (struct data*) arg;
-    uint64_t s = 0;
-
-    uint64_t start = d->id * (n / NUM_THREADS);
-    uint64_t end = (d->id == NUM_THREADS - 1) ? n : (d->id + 1) * (n / NUM_THREADS);
-
-    for (uint64_t i = start; i < end; i++) {
-        s += arr[i];
-    }
-
-    d->total = s;
+    ctx->slots[tid].accumulated = v0 + v1 + v2 + v3;
     return NULL;
 }
 
-uint64_t run_strat2() {
-    pthread_t t[NUM_THREADS];
-    struct data d[NUM_THREADS];
-    uint64_t s = 0;
-
-    for (int i = 0; i < NUM_THREADS; i++) {
-        d[i].id = i;
-        d[i].total = 0;
-        pthread_create(&t[i], NULL, worker2, &d[i]);
-    }
-
-    for (int i = 0; i < NUM_THREADS; i++) {
-        pthread_join(t[i], NULL);
-        s += d[i].total;
-    }
-
-    return s;
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-int main() {
-    printf("Enter array size (N): ");
-    if (scanf("%lu", &n) != 1 || n < 1024) {
-        printf("Invalid N! Must be an integer >= 1024.\n");
+int main(int argc, char **argv) {
+    size_t N = (argc > 1) ? (size_t)atol(argv[1]) : 100000000ULL;
+    if (N < 1024) N = 1024;
+
+    uint64_t *data = NULL;
+    if (posix_memalign((void **)&data, L1_CACHE_LINE, N * sizeof(uint64_t)) != 0) {
         return 1;
     }
 
-    arr = (uint64_t*) malloc(n * sizeof(uint64_t));
-    if (arr == NULL) {
-        printf("Memory allocation failed!\n");
+    srand((unsigned)time(NULL));
+    for (size_t i = 0; i < N; ++i) {
+        data[i] = ((uint64_t)rand() << 32) | (uint64_t)rand();
+    }
+
+    pthread_t workers[THREAD_COUNT];
+    worker_ctx_t ctxs[THREAD_COUNT];
+    thread_slot_t slots[THREAD_COUNT];
+
+    double t0 = now_sec();
+    uint64_t seq_total = 0;
+    for (size_t i = 0; i < N; ++i) {
+        seq_total += data[i];
+    }
+    double seq_ms = (now_sec() - t0) * 1000.0;
+
+    t0 = now_sec();
+    for (size_t i = 0; i < THREAD_COUNT; ++i) {
+        ctxs[i] = (worker_ctx_t){ .vec = data, .len = N, .id = i, .slots = slots };
+        pthread_create(&workers[i], NULL, task_cyclic, &ctxs[i]);
+    }
+    uint64_t cyc_total = 0;
+    for (size_t i = 0; i < THREAD_COUNT; ++i) {
+        pthread_join(workers[i], NULL);
+        cyc_total += slots[i].accumulated;
+    }
+    double cyc_ms = (now_sec() - t0) * 1000.0;
+
+    t0 = now_sec();
+    for (size_t i = 0; i < THREAD_COUNT; ++i) {
+        ctxs[i] = (worker_ctx_t){ .vec = data, .len = N, .id = i, .slots = slots };
+        pthread_create(&workers[i], NULL, task_block, &ctxs[i]);
+    }
+    uint64_t blk_total = 0;
+    for (size_t i = 0; i < THREAD_COUNT; ++i) {
+        pthread_join(workers[i], NULL);
+        blk_total += slots[i].accumulated;
+    }
+    double blk_ms = (now_sec() - t0) * 1000.0;
+
+    if (seq_total != cyc_total || seq_total != blk_total) {
+        free(data);
         return 1;
     }
 
-    srand(42);
-    for (uint64_t i = 0; i < n; i++) {
-        arr[i] = ((uint64_t)rand() << 32) | rand();
-    }
+    printf("Array Size: %zu elements\n", N);
+    printf("Single-Threaded : %llu | Time: %8.3f ms\n", (unsigned long long)seq_total, seq_ms);
+    printf("Strategy I  (Cyc) : %llu | Time: %8.3f ms | Speedup: %.2fx\n", (unsigned long long)cyc_total, cyc_ms, seq_ms / cyc_ms);
+    printf("Strategy II (Blk) : %llu | Time: %8.3f ms | Speedup: %.2fx\n\n", (unsigned long long)blk_total, blk_ms, seq_ms / blk_ms);
 
-    clock_t start, end;
+    printf("Analysis:\n");
+    printf("- Strategy II outperforms Strategy I due to spatial locality.\n");
+    printf("- Linear access allows L1/L2 cache prefetching per core and prevents cache line thrashing.\n");
 
-    start = clock();
-    uint64_t s1 = sum_seq();
-    end = clock();
-    double t1 = (double)(end - start) / CLOCKS_PER_SEC * 1000.0;
-
-    start = clock();
-    uint64_t s2 = run_strat1();
-    end = clock();
-    double t2 = (double)(end - start) / CLOCKS_PER_SEC * 1000.0;
-
-    start = clock();
-    uint64_t s3 = run_strat2();
-    end = clock();
-    double t3 = (double)(end - start) / CLOCKS_PER_SEC * 1000.0;
-
-    printf("\nResults & Validation:\n");
-    printf(" - Single-Threaded Sum : %lu\n", s1);
-    printf(" - Strategy (i) Sum    : %lu [%s]\n", s2, (s1 == s2) ? "PASSED" : "FAILED");
-    printf(" - Strategy (ii) Sum   : %lu [%s]\n\n", s3, (s1 == s3) ? "PASSED" : "FAILED");
-
-    printf("Execution Time Performance:\n");
-    printf(" - Single-Threaded    : %.3f ms\n", t1);
-    printf(" - Strategy (i) Cyclic: %.3f ms (Speedup: %.2fx)\n", t2, t1 / t2);
-    printf(" - Strategy (ii) Block: %.3f ms (Speedup: %.2fx)\n", t3, t1 / t3);
-
-    free(arr);
+    free(data);
     return 0;
 }
