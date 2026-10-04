@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <time.h>
+#include <string.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl31.h>
@@ -114,10 +115,14 @@ static void sim_grid(EGLDisplay dpy, EGLContext ctx, int m) {
         glUniform1f(u_s_loc, (float)rand() / (float)RAND_MAX + (float)ep);
 
         glDispatchCompute((m + 15) / 16, (m + 15) / 16, 1);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
 
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, b[1 - pp]);
-        glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sz, buf);
+        void *ptr = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sz, GL_MAP_READ_BIT);
+        if (ptr) {
+            memcpy(buf, ptr, sz);
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        }
 
         active = false;
         for (int i = 0; i < m * m; ++i) {
