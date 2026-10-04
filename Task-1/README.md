@@ -1,27 +1,42 @@
-# Task 1: Parallel Array Summation using Pthreads
+# High-Performance Multi-Threaded 64-Bit Array Reduction
 
-## Overview
-This program calculates the sum of a large array of 64-bit unsigned integers (N >= 1024) using C and the POSIX pthreads API. 
-
-It compares two multi-threaded execution strategies using 4 threads against a single-threaded sequential baseline:
-1. **Sequential Baseline:** A single thread iterates sequentially from index 0 to N-1.
-2. **Strategy i (Cyclic Decomposition):** Thread i computes elements at index x where `x % 4 == i`.
-3. **Strategy ii (Block Decomposition):** Thread i computes elements in the range `i * (N / 4)` to `(i + 1) * (N / 4)`.
+A low-level C implementation comparing parallel workload decomposition strategies for 64-bit unsigned integer reductions using POSIX Threads (pthreads).
 
 ---
 
-## File Structure
-- `src/task1.c` - Complete C source code containing sequential, cyclic, and block summation strategies along with benchmarking timing logic.
+## Technical Highlights
+
+- Hardware Memory Alignment: Dynamic memory allocation via posix_memalign aligned to 64-byte boundaries (L1 cache line width) to prevent unaligned memory access penalties.
+- Cache-Line Padding (alignas(64)): Thread-local accumulation structures isolated on distinct cache lines to eliminate L1 Cache Line Bouncing (False Sharing).
+- Instruction-Level Parallelism (ILP): Manual 4-way register unrolling breaking data dependency chains to maximize CPU execution pipeline throughput.
+- Zero Heavy Dependencies: Pure C11 code relying strictly on Standard C libraries and libpthread.
 
 ---
 
-## How to Build and Run
+## Parallel Strategies
 
-### Prerequisites
-- GCC Compiler
-- Linux environment (or WSL / Termux)
+Given an array A of size N >= 1024 and thread index i in {0, 1, 2, 3}:
 
-### Commands
-Compile the code with Optimization (-O2) and POSIX Threads (-pthread):
+### 1. Strategy I: Cyclic / Interleaved Decomposition
+Each thread i computes partial sums of elements at indices x matching:
+x % 4 == i
+
+- Memory Pattern: Non-contiguous strided access (32 bytes stride).
+- Cache Behavior: Multiple CPU cores compete for identical or adjacent 64-byte cache lines, causing cache thrashing and pipeline stalls.
+
+### 2. Strategy II: Block / Contiguous Decomposition
+Each thread i computes partial sums across a contiguous range:
+Range_i = [i * (N / 4), (i + 1) * (N / 4))
+
+- Memory Pattern: Pure linear sequential streaming.
+- Cache Behavior: Maximizes spatial locality. Loading a single 64-byte cache line brings 8 uint64_t elements directly into L1/L2 cache for execution by a single core.
+
+---
+
+## Build and Execution
+
+### Compilation
+Compile using GCC with Level 2 optimizations (-O2) and POSIX Threads linking:
+
 ```bash
-gcc -O2 -pthread src/task1.c -o task1
+gcc -O2 src/task1.c -lpthread -o task1
