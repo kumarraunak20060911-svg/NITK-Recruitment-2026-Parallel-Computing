@@ -1,27 +1,24 @@
-# Task 3: Forest Fire Cellular Automaton (ESSL & EGL)
+# Task 3: Forest Fire Simulation via ESSL 3.10 Compute Shaders
 
-A parallel simulation of a Forest Fire Cellular Automaton executed on GPU compute hardware via EGL and ESSL 3.10 Compute Shaders.
+## Overview
+This repository contains an implementation of a two-dimensional cellular automaton simulating a forest fire spreading across an $M \times M$ grid. The compute workload is offloaded to the GPU using ESSL 3.10 compute shaders managed via EGL 1.4+ and OpenGL ES 3.1+ APIs on Android Termux.
 
-## Problem Statement
+## State Transitions & Rules
+Each cell in the grid represents a tree in one of three states:
+- `Healthy (H)`: Value `0`
+- `Burning (B)`: Value `1`
+- `Nothing (N)`: Value `2`
 
-The simulation tracks tree status across a 2D grid (M x M) evolving over discrete time steps (epochs) based on three transition rules:
-1. **Burning (1) -> Burnt/Nothing (2):** A burning tree burns out completely in the next epoch.
-2. **Healthy (0) -> Burning (1):** A healthy tree catches fire in the next epoch with probability p = 0.15 if at least one adjacent neighbor (8-neighborhood) is currently burning.
-3. **Burnt/Nothing (2) -> Burnt/Nothing (2):** Burnt state remains unchanged.
+Simulation dynamics per epoch:
+1. `Burning (B)` cells transition to `Nothing (N)`.
+2. `Healthy (H)` cells transition to `Burning (B)` with probability $p = 0.15$ if at least one 8-way neighbor is currently `Burning (B)`.
+3. All other cells retain their state.
+4. Execution halts when zero `Burning (B)` cells remain.
 
-The simulation terminates automatically when zero burning trees remain.
-
-## Implementation Details
-
-- **Headless GPU Acceleration:** Uses **EGL** to establish an off-screen OpenGL ES 3.1 context without requiring a display server or window manager.
-- **Compute Shader:** Written in **ESSL 3.10** and embedded directly in the C source code for lightweight deployment.
-- **Data Transfer:** Employs **Shader Storage Buffer Objects (SSBOs)** with double-buffering for lock-free GPU state updates.
-- **Host-Device Sync:** Transfers frame state back to host memory using `glMapBufferRange`.
+## System Requirements
+- Android NDK / Termux environment
+- libEGL (`-lEGL`)
+- libGLESv3 (`-lGLESv3`)
+- GCC / Clang C compiler
 
 ## Project Structure
-
-```text
-Task-3/
-├── README.md
-└── src/
-    └── task3.c
